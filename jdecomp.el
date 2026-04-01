@@ -47,9 +47,9 @@
   "Type of Java decompiler to use."
   :group 'jdecomp
   :type '(radio
-          (const :tag "CFR" 'cfr)
-          (const :tag "Fernflower" 'fernflower)
-          (const :tag "Procyon" 'procyon)))
+          (const :tag "CFR" cfr)
+          (const :tag "Fernflower" fernflower)
+          (const :tag "Procyon" procyon)))
 
 (defcustom jdecomp-decompiler-paths nil
   "Alist of Java decompiler types and their paths."
@@ -62,6 +62,18 @@
   :group 'jdecomp
   :options '(cfr fernflower procyon)
   :type '(alist :key-type symbol :value-type (repeat string)))
+
+(defcustom jdecomp-java-path nil
+  "Path to the Java installation directory (JAVA_HOME).
+
+When nil, the Java executable found on PATH is used and JAVA_HOME
+is left unset.  When set to a directory, the Java executable
+\"/bin/java\" under that directory is used for JAR-based
+decompilers, and JAVA_HOME is set to that directory for
+executable-based decompilers (e.g. a Homebrew fernflower wrapper)."
+  :group 'jdecomp
+  :type '(choice (const :tag "Use Java from PATH" nil)
+                 (directory :tag "Java installation directory (JAVA_HOME)")))
 
 
 ;;;; Utilities
@@ -87,6 +99,32 @@
 (defun jdecomp--classfile-p (file)
   "Return t if FILE is a Java class file."
   (string= (file-name-extension file) "class"))
+
+(defun jdecomp--executable-p (file)
+  "Return t if FILE is an executable file."
+  (and (file-exists-p file)
+       (file-executable-p file)
+       (not (file-directory-p file))))
+
+(defun jdecomp--java-executable ()
+  "Return the java executable to use.
+
+If `jdecomp-java-path' is set, return \"<jdecomp-java-path>/bin/java\".
+Otherwise return \"java\", relying on PATH."
+  (if jdecomp-java-path
+      (expand-file-name "bin/java" jdecomp-java-path)
+    "java"))
+
+(defun jdecomp--java-home-environment ()
+  "Return a `process-environment' with JAVA_HOME set from `jdecomp-java-path'.
+
+When `jdecomp-java-path' is nil, JAVA_HOME is removed so the
+executable wrapper can choose its own Java."
+  (let ((env (cl-remove-if (lambda (e) (string-prefix-p "JAVA_HOME=" e))
+                            process-environment)))
+    (if jdecomp-java-path
+        (cons (concat "JAVA_HOME=" (expand-file-name jdecomp-java-path)) env)
+      env)))
 
 (defun jdecomp--java-files (dir)
   "Return list of Java files in directory DIR."
@@ -186,7 +224,9 @@ Optional parameter DECOMPILER-TYPE defaults to
   (unless (condition-case nil
               (cl-ecase decompiler-type
                 ('cfr (jdecomp--jar-p (jdecomp--decompiler-path 'cfr)))
-                ('fernflower (jdecomp--jar-p (jdecomp--decompiler-path 'fernflower)))
+                ('fernflower (let ((path (jdecomp--decompiler-path 'fernflower)))
+                               (or (jdecomp--jar-p path)
+                                   (jdecomp--executable-p path))))
                 ('procyon (jdecomp--jar-p (jdecomp--decompiler-path 'procyon))))
             (error (user-error "%s is not a known decompiler" decompiler-type)))
     (user-error "%s decompiler is not available" decompiler-type)))
@@ -201,7 +241,7 @@ applicable."
   (jdecomp--ensure-decompiler 'cfr)
   (with-output-to-string
     (let ((classpath (or jar (file-name-directory file) default-directory)))
-      (apply #'call-process "java" nil standard-output nil
+      (apply #'call-process (jdecomp--java-executable) nil standard-output nil
              `("-jar" ,(expand-file-name (jdecomp--decompiler-path 'cfr))
                "--extraclasspath" ,classpath
                ,@(jdecomp--decompiler-options 'cfr)
@@ -216,21 +256,37 @@ Optional parameter EXTRACTED-P, when non-nil, indicates that FILE
 was extracted from a JAR with `jdecomp--extract-to-file'."
   (jdecomp--ensure-decompiler 'fernflower)
   (with-temp-buffer
-    (let* ((classpath (or (file-name-directory file) default-directory))
+    (let* ((decompiler-path (expand-file-name (jdecomp--decompiler-path 'fernflower)))
+           (classpath (or (file-name-directory file) default-directory))
            (destination (if extracted-p
                             (file-name-directory file)
-                          (jdecomp--make-temp-file (concat "jdecomp" (file-name-sans-extension file)) t))))
-      ;; The java-decompiler.jar is not executable
-      ;; See: http://stackoverflow.com/a/39868281/864684
-      (apply #'call-process "java" nil nil nil
-             `("-cp" ,(expand-file-name (jdecomp--decompiler-path 'fernflower))
-               "org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler"
-               "-cp" ,classpath
-               ,@(jdecomp--decompiler-options 'fernflower)
-               ,file
-               ,destination))
-      (insert-file-contents (cl-first (jdecomp--java-files destination)))
-      (buffer-string))))
+                          (jdecomp--make-temp-file (concat "jdecomp" (file-name-sans-extension file)) t)))
+           (exit-code
+            (if (jdecomp--executable-p decompiler-path)
+                ;; Executable fernflower (e.g. /opt/homebrew/bin/fernflower)
+                ;; Set/unset JAVA_HOME per jdecomp-java-path.
+                (let ((process-environment (jdecomp--java-home-environment)))
+                  (apply #'call-process decompiler-path nil nil nil
+                         `("-cp" ,classpath
+                           ,@(jdecomp--decompiler-options 'fernflower)
+                           ,file
+                           ,destination)))
+              ;; JAR-based fernflower: java -cp <jar> ConsoleDecompiler ...
+              ;; See: http://stackoverflow.com/a/39868281/864684
+              (apply #'call-process (jdecomp--java-executable) nil nil nil
+                     `("-cp" ,decompiler-path
+                       "org.jetbrains.java.decompiler.main.decompiler.ConsoleDecompiler"
+                       "-cp" ,classpath
+                       ,@(jdecomp--decompiler-options 'fernflower)
+                       ,file
+                       ,destination)))))
+      (unless (zerop exit-code)
+        (user-error "Fernflower decompilation failed with exit code %d" exit-code))
+      (let ((java-files (jdecomp--java-files destination)))
+        (unless java-files
+          (user-error "Fernflower produced no output for %s in %s" file destination))
+        (insert-file-contents (cl-first java-files))
+        (buffer-string)))))
 
 (defun jdecomp--fernflower-decompile-file-in-jar (file jar)
   "Decompile FILE with Fernflower and return result as string.
@@ -262,7 +318,7 @@ Optional parameter EXTRACTED-P, when non-nil, indicates that FILE
 was extracted from a JAR with `jdecomp--extract-to-file'."
   (jdecomp--ensure-decompiler 'procyon)
   (with-output-to-string
-    (apply #'call-process "java" nil standard-output nil
+    (apply #'call-process (jdecomp--java-executable) nil standard-output nil
            `("-jar" ,(expand-file-name (jdecomp--decompiler-path 'procyon))
              ,@(jdecomp--decompiler-options 'procyon)
              ,file))))
